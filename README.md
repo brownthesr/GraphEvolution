@@ -10,4 +10,4 @@ correspond to a linear path in the latent space. We will use a Graph-Transformer
 We have been able to successfully develop an autoencoder that works for small graphs. It is very tempermental with the learning rate and takes a long time to train. We are currently performing a hyperparameter sweep and developing a more scaleable model.
 
 Here are some results from a graph with 30 nodes
-![](epoch_68 graph generation.png)
+![](init_graph.png)
