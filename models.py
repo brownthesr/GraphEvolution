@@ -3,6 +3,7 @@ import torch.nn as nn
 from torch.nn import TransformerEncoderLayer as Layer
 from torch.nn import TransformerEncoder as Encoder
 from torch.nn import Transformer
+from torch_geometric.nn import DenseGCNConv, Sequential, DenseSAGEConv, BatchNorm
 import lightning as L
 
 from utils import positional_embedding, draw_graph
@@ -13,62 +14,108 @@ NEW_NODE = torch.Tensor([2]).long()
 EOS_TOKEN = torch.Tensor([3]).long()
 SOS_TOKEN = torch.Tensor([4]).long()
 
-class GraphEncoder(nn.Module):
-    def __init__(self, num_states, d_model, num_layers):
+class CustomBatchNorm(nn.BatchNorm1d):
+    def __init__(self, num_features, eps=1e-5, momentum=0.1, affine=True, track_running_stats=True):
+        super(CustomBatchNorm, self).__init__(num_features, eps, momentum, affine, track_running_stats)
+        self.num_features = num_features
+    
+    def forward(self, x, edge_index=None):
+        """
+        Applies batch norm but only to features
+        """
+        s,g,n = x.shape
+        x = super(CustomBatchNorm, self).forward(x.reshape(-1,n)).reshape(s,g,n)
+        return x
+
+class GCN(nn.Module):   
+    def __init__(self, num_states, d_model, d_out):
         super().__init__()
-        self.d_model = d_model
+        self.num_states = num_states
         self.cls = torch.Tensor([num_states]).long()
-        encoder_layer = Layer(d_model = d_model, nhead = 8, batch_first=True)
-        self.encoder = Encoder(encoder_layer,num_layers=num_layers)
-        self.emb = nn.Embedding(num_states+1,d_model)
-        self.position_encoding_embedder = nn.Linear(8,d_model)
+
+        self.d_model = d_model
+        self.d_out=d_out
+        self.emb = nn.Embedding(num_states+1,d_model//2)
         self.cls_encoding_embedder = nn.Sequential(nn.Linear(8,d_model),
                                                    nn.ReLU(),
-                                                   nn.Linear(d_model,d_model))
-        self.device="cuda"
+                                                   nn.Linear(d_model,d_model//2))
+        self.position_encoding_embedder = nn.Linear(8,d_model//2)
+        self.encoder = Sequential('x, edge_index',
+                                  [(DenseSAGEConv(d_model,d_model),'x, edge_index -> x'),
+                                   CustomBatchNorm(d_model),
+                                 nn.ReLU(),
+                                 (DenseSAGEConv(d_model,d_model),'x, edge_index -> x'),
+                                 CustomBatchNorm(d_model),
+                                 nn.ReLU(),
+                                 (DenseSAGEConv(d_model,d_model),'x, edge_index -> x'),
+                                 CustomBatchNorm(d_model),
+                                 nn.ReLU(),
+                                 (DenseSAGEConv(d_model,d_model),'x, edge_index -> x'),
+                                 CustomBatchNorm(d_model),
+                                 nn.ReLU(),
+                                 (DenseSAGEConv(d_model,d_model),'x, edge_index -> x')])
+        self.device = "cuda"
+    def forward(self, A,x):
+        """
+        Forward pass
 
-    def forward(self, A, x):
-        A = A+torch.eye(A.shape[-1]).to(self.device)
+        Parameters
+        ----------
+        A: torch tensor of shape (batch_size, num_nodes, num_nodes)
+            The adjacency matrices
+        x: torch tensor of shape (batch_size, num_nodes, feature_dim)
+            The features of our nodes
+        
+        Returns
+        -------
+        torch.Tensor: The forward pass of our model.
+
+        """
         embeddings = self.emb(x)
-        positional_encodings, eigenvalues = self.positional_encoding(A)
+        positional_encodings, eigenvalues = self.positional_encoding(A+torch.eye(A.shape[-1]).to(self.device))
         positional_encodings = self.position_encoding_embedder(positional_encodings)
         eigenvalues = self.cls_encoding_embedder(eigenvalues)
-        embeddings += positional_encodings
-        cls_token = (self.emb(self.cls.to(A.device))).repeat(A.shape[0],1,1)+ eigenvalues.unsqueeze(1)
+        embeddings = torch.dstack((embeddings,positional_encodings))
+        cls_token = torch.dstack(((self.emb(self.cls.to(A.device))).repeat(A.shape[0],1,1),eigenvalues.unsqueeze(1)))
         embeddings = torch.hstack((embeddings,cls_token))
         A= torch.dstack((A,torch.ones(A.shape[0],A.shape[-1],1).to(A.device)))
         A= torch.hstack((A,torch.ones(A.shape[0],1,A.shape[-1]).to(A.device)))
-        adj_mask = self.adj_mask(A)
-        output = self.encoder(embeddings, mask = adj_mask.repeat(8,1,1))
-        cls_output = output[:,-1]# get the last elt we put in
-
+        # adj_mask = self.adj_mask(A)
+        output = self.encoder(embeddings,A)
+        cls_output = output.sum(dim=-2)# get the last elt we put in
         return cls_output
 
+    def positional_encoding(self,A, pos_enc_dim = 8, normalized = True):
+        """
+        Graph positional encoding v/ Laplacian eigenvectors
 
+        Returns the nodes spectral coordinates to be used as positional
+        encodings. This informs the network about global structure.
+
+        Parameters
+        ----------
+        A: torch tensor of shape (batch_size, num_nodes, num_nodes)
+            The adjacency matrices
+        pos_enc_dim: int
+            The dimension of our positional encoding
+        normalized: bool
+            Whether to use the normalized Laplacian or not
+
+        Returns
+        -------
+        torch.Tensor: The positional encoding of our graphs
+        """
+
+        if normalized:
+            # Laplacian symmetric
+            D=torch.diag_embed(A.sum(dim=-1)**(-.5))
+            L = torch.eye(A.shape[-1]).to(self.device) - D @ A.float() @ D
+        else:
+            # regular laplacian 
+            D=torch.diag_embed(A.sum(dim=-1))
+            L = D-A
         
-    def adj_mask(self, A):
-    # Create a mask of -inf and zeros
-        mask_values = torch.full((A.shape[-1], A.shape[-1]), float('-inf'), device=self.device)
-        zeros = torch.zeros((A.shape[-1], A.shape[-1]), device=self.device)
-
-        # Use where to set entries corresponding to zeros in A to -inf and non-zeros to 0
-        mask = torch.where(A == 0, mask_values, zeros)
-
-        return mask
-    def positional_encoding(self,A, pos_enc_dim = 8):
-        """
-            Graph positional encoding v/ Laplacian eigenvectors
-        """
-
-        # Laplacian
-        D=torch.diag_embed(A.sum(dim=-1)**(-.5))
-        # print(A)
-        # print(A.sum(dim=-1))
-        # print(A.shape,D.shape)
-        L = torch.eye(A.shape[-1]).to(self.device) - D @ A.float() @ D
-
-        # print(L)
-        # Eigenvectors with numpy
+        # Eigenvectors with torch
         eig_results = torch.linalg.eig(L)
     
         # Extract eigenvalues and eigenvectors
@@ -81,8 +128,126 @@ class GraphEncoder(nn.Module):
         # Use the indices to rearrange the eigenvectors
         sorted_EigVal = torch.gather(EigVal, -1, sorted_indices)
         sorted_EigVec = torch.gather(EigVec, -1, sorted_indices.unsqueeze(-1).expand(EigVec.shape))
-        symmetric = sorted_EigVec.permute(0,2,1)
+        symmetric = sorted_EigVec
+
+        # Return Spectral Node Coordinates
+        return symmetric[:, :, 1:pos_enc_dim+1].float(), sorted_EigVal[:,1:pos_enc_dim+1]
+
+class GraphEncoder(nn.Module):
+    def __init__(self, num_states, d_model, num_layers):
+        super().__init__()
+        self.d_model = d_model
+        self.cls = torch.Tensor([num_states]).long()
+        encoder_layer = Layer(d_model = d_model, nhead = 4, batch_first=True)
+        self.encoder = Encoder(encoder_layer,num_layers=num_layers)
+        self.emb = nn.Embedding(num_states+1,d_model//2)
+        self.position_encoding_embedder = nn.Linear(8,d_model//2)
+        self.cls_encoding_embedder = nn.Sequential(nn.Linear(8,d_model),
+                                                   nn.ReLU(),
+                                                   nn.Linear(d_model,d_model//2))
+        self.device="cuda"
+
+    def forward(self, A, x):
+        """
+        Forward pass
+
+        Parameters
+        ----------
+        A: torch tensor of shape (batch_size, num_nodes, num_nodes)
+            The adjacency matrices
+        x: torch tensor of shape (batch_size, num_nodes, feature_dim)
+            The features of our nodes
+        
+        Returns
+        -------
+        torch.Tensor: The forward pass of our model.
+
+        """
+        A = A+torch.eye(A.shape[-1]).to(self.device)
+        embeddings = self.emb(x)
+        positional_encodings, eigenvalues = self.positional_encoding(A)
+        positional_encodings = self.position_encoding_embedder(positional_encodings)
+        eigenvalues = self.cls_encoding_embedder(eigenvalues)
+        embeddings = torch.dstack((embeddings,positional_encodings))
+        cls_token = torch.dstack(((self.emb(self.cls.to(A.device))).repeat(A.shape[0],1,1),eigenvalues.unsqueeze(1)))
+        embeddings = torch.hstack((embeddings,cls_token))
+        A= torch.dstack((A,torch.ones(A.shape[0],A.shape[-1],1).to(A.device)))
+        A= torch.hstack((A,torch.ones(A.shape[0],1,A.shape[-1]).to(A.device)))
+        adj_mask = self.adj_mask(A)
+        output = self.encoder(embeddings,mask = adj_mask.repeat(4,1,1))
+        cls_output = output.sum(dim=-2)# get the last elt we put in
+
+        return cls_output
+        
+    def adj_mask(self, A):
+        """
+        Generates a self-attention mask for graphs
+
+        This creates a mask so that nodes only pay attention to their neighbors
+
+        Parameters
+        ----------
+        A: torch tensor of shape (batch_size, num_nodes, num_nodes)
+            The set of adjacency matrices
+        
+        Returns
+        -------
+        torch.tensor: A mask for the graphs.
+        """
+        mask_values = torch.full((A.shape[-1], A.shape[-1]), float('-inf'), device=self.device)
+        zeros = torch.zeros((A.shape[-1], A.shape[-1]), device=self.device)
+
+        # Use where to set entries corresponding to zeros in A to -inf and non-zeros to 0
+        mask = torch.where(A == 0, mask_values, zeros)
+
+        return mask
     
+    def positional_encoding(self,A, pos_enc_dim = 8, normalized = True):
+        """
+            Graph positional encoding v/ Laplacian eigenvectors
+
+            Returns the nodes spectral coordinates to be used as positional
+            encodings. This informs the network about global structure.
+
+            Parameters
+            ----------
+            A: torch tensor of shape (batch_size, num_nodes, num_nodes)
+                The adjacency matrices
+            pos_enc_dim: int
+                The dimension of our positional encoding
+            normalized: bool
+                Whether to use the normalized Laplacian or not
+
+            Returns
+            -------
+            torch.Tensor: The positional encoding of our graphs
+        """
+
+        if normalized:
+            # Laplacian symmetric
+            D=torch.diag_embed(A.sum(dim=-1)**(-.5))
+            L = torch.eye(A.shape[-1]).to(self.device) - D @ A.float() @ D
+        else:
+            # regular laplacian 
+            D=torch.diag_embed(A.sum(dim=-1))
+            L = D-A
+        
+        # Eigenvectors with torch
+        eig_results = torch.linalg.eig(L)
+    
+        # Extract eigenvalues and eigenvectors
+        EigVal = torch.real(eig_results.eigenvalues)
+        EigVec = torch.real(eig_results.eigenvectors)
+
+        # Sort eigenvalues in ascending order and get the indices
+        sorted_indices = torch.argsort(EigVal, dim=-1, descending=False)
+
+        # Use the indices to rearrange the eigenvectors
+        sorted_EigVal = torch.gather(EigVal, -1, sorted_indices)
+        sorted_EigVec = torch.gather(EigVec, -1, sorted_indices.unsqueeze(-1).expand(EigVec.shape))
+        symmetric = sorted_EigVec
+
+        # Return Spectral Node Coordinates
         return symmetric[:, :, 1:pos_enc_dim+1].float(), sorted_EigVal[:,1:pos_enc_dim+1]
 
 class GraphAutoEncoder(L.LightningModule):
@@ -102,7 +267,7 @@ class GraphAutoEncoder(L.LightningModule):
                                          nn.Linear(d_model,5)
                                          )
         self.embedding_size = d_model
-        self.encoder = GraphEncoder(d_data,d_model,num_layers)
+        self.encoder = GCN(d_data,d_model,num_layers)
         encoder_layer = Layer(d_model=d_model,nhead=4,batch_first=True)
         self.decoder = Encoder(encoder_layer=encoder_layer,num_layers = num_layers)
         self.criterion_soft = nn.MSELoss()
@@ -138,9 +303,11 @@ class GraphAutoEncoder(L.LightningModule):
         return loss
 
     def on_train_epoch_start(self):
+        """
+        Samples from our model at the start of every epoch.
+        """
         with torch.no_grad():
-            print("encoder:")
-            # print(self.encoder(self.A.unsqueeze(0).to(self.device),torch.argmax(self.b.unsqueeze(0).to(self.device),dim=-1)))
+            print("Sampling")
             A, x = self.dataset[0]
             draw_graph(A.numpy(),torch.argmax(x,dim=-1).cpu().detach().numpy(),f"{self.current_epoch}")
             A = A.unsqueeze(0).to(self.device)
@@ -154,8 +321,8 @@ class GraphAutoEncoder(L.LightningModule):
             new_edge = self.embedder(NEW_EDGE.to(self.device)).squeeze(0)
             no_edge = self.embedder(NO_EDGE.to(self.device)).squeeze(0)
             x = []
-            A = torch.eye(9)
-            for i in range(9):
+            A = torch.eye(30)
+            for i in range(30):
                 sequence = torch.hstack((sequence,new_node_emb))
                 output = self(sequence)
                 latent_representation = self.decode_data(output[0,-1,:]).round().float()
@@ -182,8 +349,30 @@ class GraphAutoEncoder(L.LightningModule):
             communities = torch.argmax(x,dim=-1).cpu().detach().numpy()
             draw_graph(graph,communities,f"{self.current_epoch}_reconstructed")
 
-
     def get_sequence_batched(self, A,x,emb,expander,latent_embeddings):
+        """
+        Converts a graph data base into a sequence
+
+        Since Transformers work mostly with sequences, for generation we convert
+        the graph into a Sequence. This is similar to ideas from GraphRNN
+
+        Parameters
+        ----------
+        A: torch tensor of shape (batch_size, num_nodes, num_nodes)
+            The adjacency matrices
+        x: torch tensor of shape (batch_size, num_nodes, feature_dim)
+            The features of our nodes
+        emb: torch.nn.Embedding
+            Converts discrete tokens into vectors (such as SOS or EDGE)
+        expander: torch.nn.Linear
+            Expands the dimensions of node features
+        latent_embeddings: torch tensor of shape (batch_size, feature_dim)
+            The outputs from the encoder
+
+        Returns
+        -------
+        torch.tensor: Sequence representation of our graphs
+        """
         batch_size = A.shape[0]
         num_nodes = A.shape[1]
 

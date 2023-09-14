@@ -1,6 +1,5 @@
-
-from torch.utils.data import DataLoader, Dataset
-from utils import generate_ssbm
+from torch.utils.data import Dataset
+from utils import generate_ssbm, generate_dcbm
 import torch
 class GraphDataset(Dataset):
     def __init__(self, num_nodes, num_features, num_graphs = 320):
@@ -13,8 +12,8 @@ class GraphDataset(Dataset):
         return self.num_graphs
     
     def __getitem__(self,idx):
-        # graph, communities =generate_dcbm(self.num_nodes,3,.7,.05,5,1.3)
-        graph, communities = generate_ssbm(9,3,.7,.1)
+        graph, communities =generate_dcbm(self.num_nodes,3,.7,.05,5,1.3)
+        # graph, communities = generate_ssbm(self.num_nodes,self.num_features,.7,.1)
 
         # perm = np.random.permutation(self.num_nodes)
         # communities = communities[perm]
