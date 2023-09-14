@@ -9,6 +9,8 @@ correspond to a linear path in the latent space. We will use a Graph-Transformer
 ## Current Results
 We have been able to successfully develop an autoencoder that works for small graphs. It is very tempermental with the learning rate and takes a long time to train. We are currently performing a hyperparameter sweep and developing a more scaleable model.
 
-Here are some results from a graph with 30 nodes. This first figure is the graph that was encoded (a Stochastic Block model). While the second is the generated graph.
+Here are some results from a graph with 30 nodes. This first figure is the graph that was encoded (a Degree Corrected Stochastic Block model). While the second is the generated graph.
 ![](init_graph.png)
 ![](generated_graph.png)
+
+The model is able to generate Stochastic Block Models that both follow the degree distribution and clustering patterns of the original. The next step is to constrain the latent space to be linear with regards to pertinent changes in the graph structure.
