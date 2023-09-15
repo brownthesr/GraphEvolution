@@ -9,6 +9,7 @@ NEW_EDGE = torch.Tensor([1]).long()
 NEW_NODE = torch.Tensor([2]).long()
 EOS_TOKEN = torch.Tensor([3]).long()
 SOS_TOKEN = torch.Tensor([4]).long()
+
 def draw_graph(adj,communities,epoch):
     """
     Draws the graph structure of a network
@@ -45,6 +46,7 @@ def draw_graph(adj,communities,epoch):
     nx.draw(graph,node_color=colors,with_labels=True, node_size=[d*50 for d in degrees])
     plt.savefig(f"epoch:{epoch} graph generation")
     plt.clf()
+
 def positional_embedding(positions, d_model):
     """
     Generates positional embeddings for given positions.
@@ -70,6 +72,7 @@ def positional_embedding(positions, d_model):
     position_embedding[:, 1::2] = cos_term
 
     return position_embedding
+
 def get_sequence(A,x,emb):
     sequence = torch.Tensor(emb(SOS_TOKEN))
     for i,collumn in enumerate(A.T):
@@ -79,10 +82,6 @@ def get_sequence(A,x,emb):
             sequence = torch.vstack([sequence,emb(collumn[j]+1)])
     sequence = torch.vstack([sequence,emb(EOS_TOKEN)])
     return torch.Tensor(sequence)
-
-
-
-
 
 def generate_ssbm(num_nodes,num_classes,p_intra,p_inter,community = None):
     """Generates a SSBM.
@@ -142,6 +141,7 @@ def generate_ssbm(num_nodes,num_classes,p_intra,p_inter,community = None):
     graph = graph*1# this converts it to a int tensor
     graph += graph.T
     return graph,communities
+
 def generate_power_distr(num_nodes, gamma):
     """Pulls node degrees from a powerlaw distribution
 

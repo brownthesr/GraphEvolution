@@ -32,14 +32,14 @@ class GCN(nn.Module):
         super().__init__()
         self.num_states = num_states
         self.cls = torch.Tensor([num_states]).long()
-
+        self.eigen_positions= 8
         self.d_model = d_model
         self.d_out=d_out
         self.emb = nn.Embedding(num_states+1,d_model//2)
-        self.cls_encoding_embedder = nn.Sequential(nn.Linear(8,d_model),
+        self.cls_encoding_embedder = nn.Sequential(nn.Linear(self.eigen_positions,d_model),
                                                    nn.ReLU(),
                                                    nn.Linear(d_model,d_model//2))
-        self.position_encoding_embedder = nn.Linear(8,d_model//2)
+        self.position_encoding_embedder = nn.Linear(self.eigen_positions,d_model//2)
         self.encoder = Sequential('x, edge_index',
                                   [(DenseSAGEConv(d_model,d_model),'x, edge_index -> x'),
                                    CustomBatchNorm(d_model),
@@ -72,7 +72,7 @@ class GCN(nn.Module):
 
         """
         embeddings = self.emb(x)
-        positional_encodings, eigenvalues = self.positional_encoding(A+torch.eye(A.shape[-1]).to(self.device))
+        positional_encodings, eigenvalues = self.positional_encoding(A+torch.eye(A.shape[-1]).to(self.device),pos_enc_dim=self.eigen_positions)
         positional_encodings = self.position_encoding_embedder(positional_encodings)
         eigenvalues = self.cls_encoding_embedder(eigenvalues)
         embeddings = torch.dstack((embeddings,positional_encodings))
@@ -131,7 +131,7 @@ class GCN(nn.Module):
         symmetric = sorted_EigVec
 
         # Return Spectral Node Coordinates
-        return symmetric[:, :, 1:pos_enc_dim+1].float(), sorted_EigVal[:,1:pos_enc_dim+1]
+        return symmetric[:, :, 1:pos_enc_dim+1].float(), sorted_EigVal[:,1:pos_enc_dim+1]#torch.hstack((sorted_EigVal[:,1:pos_enc_dim//2+1],sorted_EigVal[:,-pos_enc_dim//2:]))
 
 class GraphEncoder(nn.Module):
     def __init__(self, num_states, d_model, num_layers):
@@ -251,9 +251,10 @@ class GraphEncoder(nn.Module):
         return symmetric[:, :, 1:pos_enc_dim+1].float(), sorted_EigVal[:,1:pos_enc_dim+1]
 
 class GraphAutoEncoder(L.LightningModule):
-    def __init__(self, d_model,d_data,dataset,num_layers):
+    def __init__(self, d_model,d_data,dataset,num_layers, lr, use_scheduler=False):
         super().__init__()
-
+        self.lr = lr
+        self.use_scheduler = use_scheduler
         self.embedder = nn.Embedding(5,d_model)
         self.expander = nn.Linear(d_data,d_model)
         self.decode_data = nn.Sequential(
@@ -280,7 +281,35 @@ class GraphAutoEncoder(L.LightningModule):
         return self.decoder(sequence+ position_emb.to(self.device),Transformer.generate_square_subsequent_mask(sequence.shape[-2]).to(self.device))
     
     def configure_optimizers(self):
-        return torch.optim.AdamW(lr=4e-6,params = self.parameters())
+        opt = torch.optim.AdamW(lr=self.lr,params = self.parameters())
+        if self.use_scheduler:
+            sch  = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=self.lr,div_factor=20, steps_per_epoch=2000, epochs=80, final_div_factor=10)
+            # sch  = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max = 2000*80, )
+            lr_scheduler_config = {
+                # REQUIRED: The scheduler instance
+                "scheduler": sch,
+                # The unit of the scheduler's step size, could also be 'step'.
+                # 'epoch' updates the scheduler on epoch end whereas 'step'
+                # updates it after a optimizer update.
+                "interval": "step",
+                # How many epochs/steps should pass between calls to
+                # `scheduler.step()`. 1 corresponds to updating the learning
+                # rate after every epoch/step.
+                "frequency": 1,
+                # Metric to to monitor for schedulers like `ReduceLROnPlateau`
+                "monitor": "val_loss",
+                # If set to `True`, will enforce that the value specified 'monitor'
+                # is available when the scheduler is updated, thus stopping
+                # training if not found. If set to `False`, it will only produce a warning
+                "strict": True,
+                # If using the `LearningRateMonitor` callback to monitor the
+                # learning rate progress, this keyword can be used to specify
+                # a custom logged name
+                "name": None,
+            }
+            return ([opt], [lr_scheduler_config])
+        else:
+            return opt
     
     def training_step(self, batch, batch_idx):
         A, x = batch
@@ -300,6 +329,7 @@ class GraphAutoEncoder(L.LightningModule):
             print(loss.item())
         self.log("hard_loss", loss_hard)
         self.log("soft_loss", loss_soft)
+        self.log("lr",self.trainer.optimizers[0].param_groups[0]['lr'])
         return loss
 
     def on_train_epoch_start(self):
