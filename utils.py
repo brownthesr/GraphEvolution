@@ -211,4 +211,6 @@ def generate_dcbm(num_nodes,num_classes,p_intra,p_inter,avg_degree,gamma,communi
     graph = np.logical_or(intergraph,intragraph)
     graph = graph*1# this converts it to a int tensor
     graph += graph.T
-    return graph,communities
+    graph += np.eye(num_nodes).astype(int)
+    edge_list = [(i, j) for i in range(num_nodes) for j in range(i+1, num_nodes) if graph[i, j]]
+    return graph,communities,edge_list 

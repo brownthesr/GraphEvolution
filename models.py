@@ -5,7 +5,8 @@ from torch.nn import TransformerEncoder as Encoder
 from torch.nn import Transformer
 from torch_geometric.nn import DenseGCNConv, Sequential, DenseSAGEConv, BatchNorm
 import lightning as L
-
+from torch_geometric.data import Data
+from Graph_transformer.models import GraphTransformer
 from utils import positional_embedding, draw_graph
 import torch.nn.functional as F
 NO_EDGE = torch.Tensor([0]).long()
@@ -28,11 +29,11 @@ class CustomBatchNorm(nn.BatchNorm1d):
         return x
 
 class GCN(nn.Module):   
-    def __init__(self, num_states, d_model, d_out):
+    def __init__(self, num_states, d_model, d_out,eigen_positions = 8):
         super().__init__()
         self.num_states = num_states
         self.cls = torch.Tensor([num_states]).long()
-        self.eigen_positions= 8
+        self.eigen_positions= eigen_positions
         self.d_model = d_model
         self.d_out=d_out
         self.emb = nn.Embedding(num_states+1,d_model//2)
@@ -42,16 +43,12 @@ class GCN(nn.Module):
         self.position_encoding_embedder = nn.Linear(self.eigen_positions,d_model//2)
         self.encoder = Sequential('x, edge_index',
                                   [(DenseSAGEConv(d_model,d_model),'x, edge_index -> x'),
-                                   CustomBatchNorm(d_model),
                                  nn.ReLU(),
                                  (DenseSAGEConv(d_model,d_model),'x, edge_index -> x'),
-                                 CustomBatchNorm(d_model),
                                  nn.ReLU(),
                                  (DenseSAGEConv(d_model,d_model),'x, edge_index -> x'),
-                                 CustomBatchNorm(d_model),
                                  nn.ReLU(),
                                  (DenseSAGEConv(d_model,d_model),'x, edge_index -> x'),
-                                 CustomBatchNorm(d_model),
                                  nn.ReLU(),
                                  (DenseSAGEConv(d_model,d_model),'x, edge_index -> x')])
         self.device = "cuda"
@@ -71,18 +68,41 @@ class GCN(nn.Module):
         torch.Tensor: The forward pass of our model.
 
         """
+        # Embed all of the features Nx3 Nx512
         embeddings = self.emb(x)
-        positional_encodings, eigenvalues = self.positional_encoding(A+torch.eye(A.shape[-1]).to(self.device),pos_enc_dim=self.eigen_positions)
-        positional_encodings = self.position_encoding_embedder(positional_encodings)
+
+        # Obtain the eigenvectors and eigenvlaues of the graph laplacian
+        eigenv_vectors, eigenvalues = self.positional_encoding(A,pos_enc_dim=self.eigen_positions)
+        
+        # Expand those as well Nx8 -> Nx512
+        eigenv_vectors = self.position_encoding_embedder(eigenv_vectors)
+
+        # Initially of shape 8-> 512
         eigenvalues = self.cls_encoding_embedder(eigenvalues)
-        embeddings = torch.dstack((embeddings,positional_encodings))
+
+        # concatenate embeddings Nx512 -> Nx1024
+        embeddings = torch.dstack((embeddings,eigenv_vectors))
+
+        # first 
+        # self.emb(self.cls.to(A.device))).repeat(A.shape[0],1,1) Expands cls token to Bx1x512
+        # concatenate eigenvalue to unique cls token Bx1x1024
         cls_token = torch.dstack(((self.emb(self.cls.to(A.device))).repeat(A.shape[0],1,1),eigenvalues.unsqueeze(1)))
+        
+        # Append this token as a node to the graph BxNx1024-> BxN+1x1024
         embeddings = torch.hstack((embeddings,cls_token))
+
+        # add collumn and row of ones
         A= torch.dstack((A,torch.ones(A.shape[0],A.shape[-1],1).to(A.device)))
         A= torch.hstack((A,torch.ones(A.shape[0],1,A.shape[-1]).to(A.device)))
+
         # adj_mask = self.adj_mask(A)
+
+        # We run it through our SAGE/GCN
         output = self.encoder(embeddings,A)
+
+        # output is of shape BxN+1x1024
         cls_output = output.sum(dim=-2)# get the last elt we put in
+        # now of shape Bx1x1024
         return cls_output
 
     def positional_encoding(self,A, pos_enc_dim = 8, normalized = True):
@@ -250,31 +270,56 @@ class GraphEncoder(nn.Module):
         # Return Spectral Node Coordinates
         return symmetric[:, :, 1:pos_enc_dim+1].float(), sorted_EigVal[:,1:pos_enc_dim+1]
 
+
 class GraphAutoEncoder(L.LightningModule):
-    def __init__(self, d_model,d_data,dataset,num_layers, lr, use_scheduler=False):
+    def __init__(self, d_model,d_data,dataset,num_layers, 
+                 lr, use_scheduler=False, num_epochs=100,
+                 eigen_positions = 8, model = "GCN"):
         super().__init__()
         self.lr = lr
+        self.d_data= d_data
+        self.num_epochs =num_epochs
         self.use_scheduler = use_scheduler
+
+        # converts discrete tokens into vectors
         self.embedder = nn.Embedding(5,d_model)
+
+        # converts our encoder output to the right shape
         self.expander = nn.Linear(d_data,d_model)
+
+        # is a NN to decode the features
         self.decode_data = nn.Sequential(
                                         nn.Linear(d_model,d_model),
                                         nn.ReLU(),
                                         nn.Linear(d_model,d_data)
                                         )
+        
+        # This one is to decode the edges
         self.decode_edge = nn.Sequential(
                                         nn.Linear(d_model,d_model),
                                          nn.ReLU(),
                                          nn.Linear(d_model,5)
                                          )
+        
         self.embedding_size = d_model
-        self.encoder = GCN(d_data,d_model,num_layers)
+
+        # set out encoder model
+        self.model = model
+        if model == "GCN":
+            self.encoder = GCN(d_data,d_model,num_layers,eigen_positions=eigen_positions)
+        elif model == "GraphTransformer":
+            self.encoder = GraphTransformer(d_data,d_model,d_model,num_layers,use_global_pool=False)
+
+        # transformer layers
         encoder_layer = Layer(d_model=d_model,nhead=4,batch_first=True)
         self.decoder = Encoder(encoder_layer=encoder_layer,num_layers = num_layers)
-        self.criterion_soft = nn.MSELoss()
-        self.criterion_hard = nn.CrossEntropyLoss()
+
+        # define two different losses
+        self.criterion_soft = nn.MSELoss()# Target for our features
+        self.criterion_hard = nn.CrossEntropyLoss()# Target for our graph structure
+
+        # debugging
         self.dataset = dataset
-        self.A, self.b = self.dataset[0]
 
     def forward(self,sequence):
         position_emb = positional_embedding(sequence.shape[-2],self.embedding_size)
@@ -283,8 +328,8 @@ class GraphAutoEncoder(L.LightningModule):
     def configure_optimizers(self):
         opt = torch.optim.AdamW(lr=self.lr,params = self.parameters())
         if self.use_scheduler:
-            sch  = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=self.lr,div_factor=20, steps_per_epoch=2000, epochs=80, final_div_factor=10)
-            # sch  = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max = 2000*80, )
+            # sch  = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=self.lr,div_factor=20, steps_per_epoch=2000, epochs=80, final_div_factor=10)
+            sch  = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max = self.trainer.num_training_batches, )
             lr_scheduler_config = {
                 # REQUIRED: The scheduler instance
                 "scheduler": sch,
@@ -312,8 +357,31 @@ class GraphAutoEncoder(L.LightningModule):
             return opt
     
     def training_step(self, batch, batch_idx):
-        A, x = batch
-        latent_embeddings = self.encoder(A,torch.argmax(x,dim=-1))
+        if self.model == "GCN":
+            data = batch
+            A = data.adj
+            A = A.reshape(-1,30,30)
+            x = data.x
+            x = x.reshape(-1,30,self.d_data)
+            latent_embeddings = self.encoder(A,torch.argmax(x,dim=-1))
+        else:
+            data = batch
+            num_nodes = data.adj.shape[-1]
+            data_pass = Data(x=data.x, edge_index=data.edge_index)
+            print(data)
+            A = data.adj.reshape(-1,num_nodes,num_nodes)
+            print(data_pass.x.shape)
+            print(A.shape, "A.shape")
+            print(len(data.edge_index))
+            print(len(data.edge_index[0]))
+            e = torch.Tensor(data.edge_index[0])
+            print(e.shape)
+            print(len(data.edge_index[0][0]))
+            data_pass.edge_index = [torch.Tensor(data.edge_index[i]) for i in range(len(data.edge_index))]
+            # print(data_pass.edge_index.shape)
+            latent_embeddings = self.encoder(data_pass)
+            print(f"Latent embeddings shape: {latent_embeddings.shape}")
+
 
         sequence,hard_targets, soft_targets,mask = self.get_sequence_batched(A,x,self.embedder,self.expander,latent_embeddings)
         input_seq = sequence[:,:-1]
@@ -332,13 +400,17 @@ class GraphAutoEncoder(L.LightningModule):
         self.log("lr",self.trainer.optimizers[0].param_groups[0]['lr'])
         return loss
 
-    def on_train_epoch_start(self):
+    def on_train_epoch_end(self):
         """
         Samples from our model at the start of every epoch.
         """
         with torch.no_grad():
             print("Sampling")
-            A, x = self.dataset[0]
+            data = self.dataset[0]
+            A = data.adj
+            A = A.reshape(30,30)
+            x = data.x
+            x = x.reshape(30,self.d_data)
             draw_graph(A.numpy(),torch.argmax(x,dim=-1).cpu().detach().numpy(),f"{self.current_epoch}")
             A = A.unsqueeze(0).to(self.device)
             x = x.unsqueeze(0).to(self.device)
