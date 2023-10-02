@@ -81,6 +81,7 @@ gamma = 0.1
 initial_infections = 3
 
 # Generate 5 sequences again with varying node sizes between 15-30
+# again
 sequences_without_tg = []
 for _ in range(5):
     node_count = random.randint(15, 30)
