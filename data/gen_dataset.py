@@ -21,8 +21,8 @@ def draw_and_save_graphs(sequence, frame_dir, sequence_idx):
         plt.figure(figsize=(8, 6))
         
         # Draw susceptible nodes
-        susceptible_nodes = [node for node, data in graph.nodes(data=True) if data['state'] == 0]
-        nx.draw_networkx_nodes(graph, pos, nodelist=susceptible_nodes, node_color='blue', node_size=200)
+        susceptible_non_neighbors = [node for node, data in graph.nodes(data=True) if data['state'] == 0]
+        nx.draw_networkx_nodes(graph, pos, nodelist=susceptible_non_neighbors, node_color='blue', node_size=200)
         
         # Draw infected nodes
         infected_nodes = [node for node, data in graph.nodes(data=True) if data['state'] == 1]
@@ -42,14 +42,14 @@ def sis_dynamics_with_dynamic_edges(graph, beta, gamma, initial_infections, p_di
     
     Parameters:
     - graph: initial graph with all nodes susceptible.
-    - beta: infection probability.
+    - beta: probability that an edge between a susceptible node and an infected one spreads infection.
     - gamma: recovery probability.
     - initial_infections: number of initially infected nodes.
-    - p_disconnect: probability of a node disconnecting from an infected neighbor.
-    - p_connect: probability of a node trying to connect to another susceptible node (this will now be unused).
+    - p_disconnect: maximum possible probability of a node disconnecting from an infected neighbor.
+        Actual probability is p_disconnect * rho, where rho is the proportion of the population currently infected.
     
     Returns:
-    - A sequence of 20 graph states.
+    - A sequence of graph states of length time_steps.
     """
     
     # Initialize states: 0 for Susceptible, 1 for Infected
@@ -79,13 +79,13 @@ def sis_dynamics_with_dynamic_edges(graph, beta, gamma, initial_infections, p_di
                         next_graph.remove_edge(node, infected_neighbor)
                         
                         # Connect to a susceptible node once it disconnects from an infected node
-                        susceptible_nodes = [n for n in graph.nodes() if graph.nodes[n]['state'] == 0 and n != node and not graph.has_edge(node, n)]
-                        if susceptible_nodes:  # Check if there are any susceptible nodes to connect to
-                            new_friend = random.choice(susceptible_nodes)
+                        susceptible_non_neighbors = [n for n in graph.nodes() if graph.nodes[n]['state'] == 0 and n != node and not graph.has_edge(node, n)]
+                        if susceptible_non_neighbors:  # Check if there are any susceptible nodes to connect to
+                            new_friend = random.choice(susceptible_non_neighbors)
                             next_graph.add_edge(node, new_friend)
                     # For every infected neighbor you could get sick
                     if random.random() < beta:
-                        next_graph.nodes[node]['state'] =1
+                        next_graph.nodes[node]['state'] = 1
 
                 # # If the node has infected neighbors, it can get infected with probability beta
                 # if len(infected_neighbors) > 0 and random.random() < beta:
