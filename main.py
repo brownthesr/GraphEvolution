@@ -1,5 +1,5 @@
 from lightning.pytorch import loggers as pl_loggers
-from models import GraphAutoEncoder
+from GraphEvolution._models import GraphAutoEncoder
 from utils import generate_ssbm,draw_graph, generate_dcbm
 from datasets import SBMGraphDataset,GraphTDataset
 import lightning.pytorch as pl

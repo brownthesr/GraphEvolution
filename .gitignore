@@ -2,3 +2,8 @@
 wandb
 Equation_free
 *.out
+data/small_dataset/*
+data/sis_frames/*
+Equation_free/*
+core.*
+*.mp4
